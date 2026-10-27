@@ -41,15 +41,26 @@ export async function GET(request: Request) {
   const storage: RetentionStorage = admin.storage
 
   const purge = await purgeExpiredMessages({ db: admin, storage }, { cutoffIso: cutoff })
-  const conversationsDeleted = await sweepEmptyConversations(admin, cutoff)
-  const contactsDeleted = await sweepOrphanContacts(admin, cutoff)
+  const conversations = await sweepEmptyConversations(admin, cutoff)
+  const contacts = await sweepOrphanContacts(admin, cutoff)
 
-  return NextResponse.json({
-    cutoff,
-    deleted: purge.deleted,
-    storageRemoved: purge.storageRemoved,
-    storageFailures: purge.storageFailures,
-    conversationsDeleted,
-    contactsDeleted,
-  })
+  // Un job di compliance rotto non deve travestirsi da "niente da fare"
+  // (review I5): gli errori di passata diventano un 500, così il log del
+  // cron li distingue dai giri a vuoto. I singoli oggetti Storage restano
+  // best-effort (storageFailures nel corpo).
+  const errors = [purge.error, conversations.error, contacts.error].filter(
+    (e): e is string => Boolean(e),
+  )
+  return NextResponse.json(
+    {
+      cutoff,
+      deleted: purge.deleted,
+      storageRemoved: purge.storageRemoved,
+      storageFailures: purge.storageFailures,
+      conversationsDeleted: conversations.deleted,
+      contactsDeleted: contacts.deleted,
+      ...(errors.length > 0 ? { errors } : {}),
+    },
+    { status: errors.length > 0 ? 500 : 200 },
+  )
 }

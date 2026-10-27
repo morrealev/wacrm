@@ -9,9 +9,17 @@ import { MIRROR_BUCKET } from '@/lib/whatsapp/mirror-inbound-media';
  * nessun giro successivo saprebbe più ritrovare. Quindi: se la remove
  * fallisce, la riga resta e il giro successivo riprova.
  *
- * Il chiamante (route cron) passa un cutoff già calcolato: la decorrenza
- * è `messages.created_at` — la data del dato, non l'orologio di quando
- * la riga è ricomparsa (un restore da backup rientra da solo nel purge).
+ * Un oggetto può però essere CONDIVISO: il media di testata di un
+ * template viene persistito con lo stesso URL in ogni messaggio inviato
+ * (send-message.ts, meta-send.ts) e nella riga del template stesso
+ * (review C1). Prima della remove si verifica che nessun referente VIVO
+ * resti: altri `messages` fuori dal batch o `message_templates`.
+ * Se sì, si cancellano solo le righe scadute — l'oggetto cade quando
+ * scade l'ultimo referente.
+ *
+ * La decorrenza è `messages.created_at` — la data del dato, non
+ * l'orologio di quando la riga è ricomparsa (un restore da backup
+ * rientra da solo nel purge).
  */
 
 /** Superficie Storage minima, fake-abile nei test (stesso pattern di MirrorStorage). */
@@ -31,9 +39,14 @@ export interface PurgeResult {
   deleted: number;
   storageRemoved: number;
   storageFailures: number;
+  /** Valorizzato se una passata è fallita (I5): la route lo propaga come 500. */
+  error?: string;
 }
 
 const PUBLIC_MARKER = `/storage/v1/object/public/${MIRROR_BUCKET}/`;
+
+/** Le delete viaggiano a chunk: 500 UUID in query string sfiorano i limiti dei proxy (V2). */
+const DELETE_CHUNK = 100;
 
 /**
  * Path dentro `chat-media` di un `media_url`, o `null` per tutto il
@@ -53,12 +66,40 @@ export function chatMediaPathFromUrl(mediaUrl: string | null): string | null {
   }
 }
 
+/**
+ * True se l'URL ha referenti VIVI oltre alle `inBatch` righe scadute:
+ * altri messaggi (conteggio totale > batch) o la testata di un template.
+ * In caso di dubbio (errore di verifica) risponde true: l'oggetto resta
+ * e le righe con esso — un giro dopo si riprova con la verità in mano.
+ */
+async function hasLiveReferences(
+  db: SupabaseClient,
+  url: string,
+  inBatch: number,
+): Promise<boolean | 'unknown'> {
+  const { count, error } = await db
+    .from('messages')
+    .select('id', { count: 'exact', head: true })
+    .eq('media_url', url);
+  if (error || count === null) return 'unknown';
+  if (count > inBatch) return true;
+
+  const { data, error: tplError } = await db
+    .from('message_templates')
+    .select('id')
+    .eq('header_media_url', url)
+    .limit(1);
+  if (tplError) return 'unknown';
+  return (data?.length ?? 0) > 0;
+}
+
 export async function purgeExpiredMessages(
   deps: PurgeDeps,
   opts: { cutoffIso: string; batch?: number },
 ): Promise<PurgeResult> {
   const { db, storage } = deps;
   const batch = opts.batch ?? 500;
+  const esito: PurgeResult = { deleted: 0, storageRemoved: 0, storageFailures: 0 };
 
   const { data, error } = await db
     .from('messages')
@@ -67,42 +108,61 @@ export async function purgeExpiredMessages(
     .order('created_at', { ascending: true })
     .limit(batch);
   if (error) {
-    console.warn('[retention] select messaggi scaduti fallita:', error.message);
-    return { deleted: 0, storageRemoved: 0, storageFailures: 0 };
+    esito.error = `select messaggi scaduti fallita: ${error.message}`;
+    console.warn(`[retention] ${esito.error}`);
+    return esito;
   }
   const rows = (data ?? []) as Array<{ id: string; media_url: string | null }>;
-  if (rows.length === 0) return { deleted: 0, storageRemoved: 0, storageFailures: 0 };
+  if (rows.length === 0) return esito;
 
+  // Raggruppa per URL: la decisione sull'oggetto è una sola anche se
+  // dieci righe scadute lo condividono.
   const deletable: string[] = [];
-  let storageRemoved = 0;
-  let storageFailures = 0;
-
+  const byUrl = new Map<string, { path: string; ids: string[] }>();
   for (const row of rows) {
     const path = chatMediaPathFromUrl(row.media_url);
     if (!path) {
       deletable.push(row.id);
       continue;
     }
-    // Una remove per riga, non in blocco: così un solo oggetto
-    // indisponibile non tiene in ostaggio l'intero batch.
-    const { error: removeError } = await storage.from(MIRROR_BUCKET).remove([path]);
-    if (removeError) {
-      console.warn(
-        `[retention] remove Storage fallita per ${path} (riga ${row.id}): ${removeError.message} — riga conservata, si ritenta al prossimo giro`,
-      );
-      storageFailures++;
+    const group = byUrl.get(row.media_url as string) ?? { path, ids: [] };
+    group.ids.push(row.id);
+    byUrl.set(row.media_url as string, group);
+  }
+
+  for (const [url, group] of byUrl) {
+    const referenced = await hasLiveReferences(db, url, group.ids.length);
+    if (referenced === 'unknown') {
+      // Verifica fallita: non si cancella né l'oggetto né le righe —
+      // cancellare le righe orfanerebbe l'oggetto per sempre.
+      esito.storageFailures += 1;
       continue;
     }
-    storageRemoved++;
-    deletable.push(row.id);
+    if (referenced) {
+      deletable.push(...group.ids); // le righe scadute cadono, l'oggetto vive col suo ultimo referente
+      continue;
+    }
+    const { error: removeError } = await storage.from(MIRROR_BUCKET).remove([group.path]);
+    if (removeError) {
+      console.warn(
+        `[retention] remove Storage fallita per ${group.path}: ${removeError.message} — righe conservate, si ritenta al prossimo giro`,
+      );
+      esito.storageFailures += 1;
+      continue;
+    }
+    esito.storageRemoved += 1;
+    deletable.push(...group.ids);
   }
 
-  if (deletable.length === 0) return { deleted: 0, storageRemoved, storageFailures };
-
-  const { error: deleteError } = await db.from('messages').delete().in('id', deletable);
-  if (deleteError) {
-    console.warn('[retention] delete messaggi fallita:', deleteError.message);
-    return { deleted: 0, storageRemoved, storageFailures };
+  for (let i = 0; i < deletable.length; i += DELETE_CHUNK) {
+    const chunk = deletable.slice(i, i + DELETE_CHUNK);
+    const { error: deleteError } = await db.from('messages').delete().in('id', chunk);
+    if (deleteError) {
+      esito.error = `delete messaggi fallita: ${deleteError.message}`;
+      console.warn(`[retention] ${esito.error}`);
+      continue; // gli altri chunk si tentano comunque
+    }
+    esito.deleted += chunk.length;
   }
-  return { deleted: deletable.length, storageRemoved, storageFailures };
+  return esito;
 }

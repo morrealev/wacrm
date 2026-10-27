@@ -1,102 +1,50 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 /**
- * Seconda passata della retention (ROPA T-05, DEC-2026-10-27-002): dopo
- * il purge dei messaggi restano due code di dati personali che nessuno
- * vede più dall'inbox:
+ * Seconda passata della retention (ROPA T-05, DEC-2026-10-27-002): le
+ * conversazioni rimaste senza messaggi (la riga porta ancora
+ * `last_message_text` — contenuto) e i contatti senza più conversazioni.
  *
- * - conversazioni rimaste SENZA messaggi: la riga porta ancora
- *   `last_message_text` (contenuto!) e i metadati del rapporto;
- * - contatti senza più alcuna conversazione: nome e numero di qualcuno
- *   con cui non parliamo da oltre il termine.
+ * Dopo la review del branch (I1-I4) la logica vive in due RPC SQL
+ * (migration 061) come UNA delete atomica con i predicati ri-asseriti
+ * dentro il `WHERE ... NOT EXISTS`:
  *
- * Criterio ratificato: oltre 24 mesi (conversazioni: `last_message_at`;
- * contatti: `updated_at`) E nessun residuo collegato. Le conversazioni
- * con `last_message_at` NULL (mai partite) non rientrano nel criterio
- * `lt` e restano: sono prive di contenuto e il contatto a monte verrà
- * comunque raccolto qui quando invecchia... ma solo se anche la
- * conversazione sparisce — per questo il caso è dichiarato nel ROPA, non
- * nascosto qui.
+ * - niente cap PostgREST sulla verifica dei residui (I1): il NOT EXISTS
+ *   è valutato dal planner, non da una select troncabile a max-rows;
+ * - niente TOCTOU (I3): verifica e delete sono lo stesso statement;
+ * - le FK non possono far fallire il batch (I2): una conversazione
+ *   agganciata a un deal è ESCLUSA dal where, non incontrata dalla FK;
+ * - il perimetro resta quello ratificato (I4): contatti con deal o con
+ *   note NON si toccano — i loro termini sono «da definire» (gate
+ *   Piruzza), quindi lo sweep non li decide per cascata.
+ *
+ * Questi wrapper restano sottili apposta: contratto (nome, parametro,
+ * conteggio, errore) testato a fake; la semantica SQL è collaudata live
+ * iniettando righe scadute, residue e agganciate.
  */
 
-const BATCH = 500;
+export type SweepResult = { deleted: number; error?: string };
 
-/** Cancella le conversazioni oltre cutoff rimaste senza messaggi. Torna quante. */
 export async function sweepEmptyConversations(
   db: SupabaseClient,
   cutoffIso: string,
-): Promise<number> {
-  const { data: candidates, error } = await db
-    .from('conversations')
-    .select('id')
-    .lt('last_message_at', cutoffIso)
-    .limit(BATCH);
+): Promise<SweepResult> {
+  const { data, error } = await db.rpc('retention_sweep_conversations', { cutoff: cutoffIso });
   if (error) {
-    console.warn('[retention] select conversazioni scadute fallita:', error.message);
-    return 0;
+    console.warn('[retention] sweep conversazioni fallito:', error.message);
+    return { deleted: 0, error: `sweep conversazioni: ${error.message}` };
   }
-  const ids = (candidates ?? []).map((c) => (c as { id: string }).id);
-  if (ids.length === 0) return 0;
-
-  const { data: residui, error: resErr } = await db
-    .from('messages')
-    .select('conversation_id')
-    .in('conversation_id', ids);
-  if (resErr) {
-    console.warn('[retention] verifica residui messaggi fallita:', resErr.message);
-    return 0;
-  }
-  const occupate = new Set(
-    (residui ?? []).map((m) => (m as { conversation_id: string }).conversation_id),
-  );
-  const svuotate = ids.filter((id) => !occupate.has(id));
-  if (svuotate.length === 0) return 0;
-
-  const { error: delErr } = await db.from('conversations').delete().in('id', svuotate);
-  if (delErr) {
-    console.warn('[retention] delete conversazioni fallita:', delErr.message);
-    return 0;
-  }
-  return svuotate.length;
+  return { deleted: (data as number | null) ?? 0 };
 }
 
-/** Cancella i contatti oltre cutoff senza più conversazioni. Torna quanti. */
 export async function sweepOrphanContacts(
   db: SupabaseClient,
   cutoffIso: string,
-): Promise<number> {
-  const { data: candidates, error } = await db
-    .from('contacts')
-    .select('id')
-    .lt('updated_at', cutoffIso)
-    .limit(BATCH);
+): Promise<SweepResult> {
+  const { data, error } = await db.rpc('retention_sweep_contacts', { cutoff: cutoffIso });
   if (error) {
-    console.warn('[retention] select contatti scaduti fallita:', error.message);
-    return 0;
+    console.warn('[retention] sweep contatti fallito:', error.message);
+    return { deleted: 0, error: `sweep contatti: ${error.message}` };
   }
-  const ids = (candidates ?? []).map((c) => (c as { id: string }).id);
-  if (ids.length === 0) return 0;
-
-  const { data: refs, error: refErr } = await db
-    .from('conversations')
-    .select('contact_id')
-    .in('contact_id', ids);
-  if (refErr) {
-    console.warn('[retention] verifica conversazioni dei contatti fallita:', refErr.message);
-    return 0;
-  }
-  const occupati = new Set(
-    (refs ?? [])
-      .map((r) => (r as { contact_id: string | null }).contact_id)
-      .filter((v): v is string => v !== null),
-  );
-  const orfani = ids.filter((id) => !occupati.has(id));
-  if (orfani.length === 0) return 0;
-
-  const { error: delErr } = await db.from('contacts').delete().in('id', orfani);
-  if (delErr) {
-    console.warn('[retention] delete contatti fallita:', delErr.message);
-    return 0;
-  }
-  return orfani.length;
+  return { deleted: (data as number | null) ?? 0 };
 }

@@ -17,6 +17,11 @@ export function retentionCutoff(
   const months = Number(raw);
   if (!Number.isInteger(months) || months <= 0) return null;
   const cutoff = new Date(now);
+  const giorno = cutoff.getUTCDate();
   cutoff.setUTCMonth(cutoff.getUTCMonth() - months);
+  // setUTCMonth normalizza il giorno inesistente IN AVANTI (31 marzo - 1
+  // mese -> 3 marzo): cancellerebbe PRIMA del termine. La direzione
+  // conservativa è l'ultimo giorno del mese inteso (review M1).
+  if (cutoff.getUTCDate() !== giorno) cutoff.setUTCDate(0);
   return cutoff.toISOString();
 }
